@@ -1,350 +1,173 @@
-extern crate btleplug;
-
-use btleplug::api::{Central, Peripheral, UUID};
-#[cfg(target_os = "linux")]
-use btleplug::bluez::{adapter::ConnectedAdapter, manager::Manager};
-#[cfg(target_os = "macos")]
-use btleplug::corebluetooth::{adapter::Adapter, manager::Manager};
-#[cfg(target_os = "windows")]
-use btleplug::winrtble::{adapter::Adapter, manager::Manager};
-use chrono;
-use std::thread;
+use btleplug::api::{Central, Manager, Peripheral, WriteType, ScanFilter, CharPropFlags, Characteristic};
+use btleplug::platform::{Manager as PlatformManager, Peripheral as PlatformPeripheral};
 use std::time::Duration;
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn get_central(manager: &Manager) -> Adapter {
-    let adapters = manager.adapters().unwrap();
-    adapters.into_iter().nth(0).unwrap()
-}
-
-#[cfg(target_os = "linux")]
-fn get_central(manager: &Manager) -> ConnectedAdapter {
-    let adapters = manager.adapters().unwrap();
-    let adapter = adapters.into_iter().nth(0).unwrap();
-    adapter.connect().unwrap()
-}
-
-pub struct Days {
-    pub monday: u8,
-    pub tuesday: u8,
-    pub wednesday: u8,
-    pub thursday: u8,
-    pub friday: u8,
-    pub saturday: u8,
-    pub sunday: u8,
-    pub all: u8,
-    pub week_days: u8,
-    pub weekend_days: u8,
-    pub none: u8,
-}
-
-pub const WEEK_DAYS: Days = Days {
-    monday: 0x01,
-    tuesday: 0x02,
-    wednesday: 0x04,
-    thursday: 0x08,
-    friday: 0x10,
-    saturday: 0x20,
-    sunday: 0x40,
-    all: 0x01 + 0x02 + 0x04 + 0x08 + 0x10 + 0x20 + 0x40,
-    week_days: 0x01 + 0x02 + 0x04 + 0x08 + 0x10,
-    weekend_days: 0x20 + 0x40,
-    none: 0x00,
-};
-
-pub struct Effects {
-    pub jump_red_green_blue: u8,
-    pub jump_red_green_blue_yellow_cyan_magenta_white: u8,
-    pub crossfade_red: u8,
-    pub crossfade_green: u8,
-    pub crossfade_blue: u8,
-    pub crossfade_yellow: u8,
-    pub crossfade_cyan: u8,
-    pub crossfade_magenta: u8,
-    pub crossfade_white: u8,
-    pub crossfade_red_green: u8,
-    pub crossfade_red_blue: u8,
-    pub crossfade_green_blue: u8,
-    pub crossfade_red_green_blue: u8,
-    pub crossfade_red_green_blue_yellow_cyan_magenta_white: u8,
-    pub blink_red: u8,
-    pub blink_green: u8,
-    pub blink_blue: u8,
-    pub blink_yellow: u8,
-    pub blink_cyan: u8,
-    pub blink_magenta: u8,
-    pub blink_white: u8,
-    pub blink_red_green_blue_yellow_cyan_magenta_white: u8,
-}
-
-pub const EFFECTS: Effects = Effects {
-    jump_red_green_blue: 0x87,
-    jump_red_green_blue_yellow_cyan_magenta_white: 0x88,
-    crossfade_red: 0x8b,
-    crossfade_green: 0x8c,
-    crossfade_blue: 0x8d,
-    crossfade_yellow: 0x8e,
-    crossfade_cyan: 0x8f,
-    crossfade_magenta: 0x90,
-    crossfade_white: 0x91,
-    crossfade_red_green: 0x92,
-    crossfade_red_blue: 0x93,
-    crossfade_green_blue: 0x94,
-    crossfade_red_green_blue: 0x89,
-    crossfade_red_green_blue_yellow_cyan_magenta_white: 0x8a,
-    blink_red: 0x96,
-    blink_green: 0x97,
-    blink_blue: 0x98,
-    blink_yellow: 0x99,
-    blink_cyan: 0x9a,
-    blink_magenta: 0x9b,
-    blink_white: 0x9c,
-    blink_red_green_blue_yellow_cyan_magenta_white: 0x95,
-};
-
 pub struct BleLedDevice {
-    peripheral: btleplug::winrtble::peripheral::Peripheral,
-    characteristics: Vec<btleplug::api::Characteristic>,
+    peripheral: PlatformPeripheral,
+    write_characteristic: Characteristic,
 }
 
 impl BleLedDevice {
-    pub fn new() -> BleLedDevice {
-        let manager = Manager::new().unwrap();
-        let central = get_central(&manager);
-        let mut characteristics;
-        let peripheral;
+    pub async fn new_with_address(addr_str: &str) -> Result<Self, String> {
+        let manager = PlatformManager::new().await
+            .map_err(|e| format!("Failed to create manager: {}", e))?;
 
-        central.start_scan().unwrap();
-        thread::sleep(Duration::from_secs(1));
+        let adapters = manager.adapters().await
+            .map_err(|e| format!("Failed to get adapters: {}", e))?;
 
-        let address = btleplug::api::BDAddr {
-            address: [0x3B, 0x56, 0x01, 0x50, 0x89, 0xBE],
-        };
-        loop {
-            match central.peripheral(address) {
-                Some(p) => {
-                    peripheral = p;
-                    ////////// CONNECTION AND FETCHING OF CHARACTERISTICS
-                    while peripheral.connect().is_err() {
-                        thread::sleep(Duration::from_millis(100));
-                    }
+        let central = adapters.into_iter().next()
+            .ok_or("No Bluetooth adapters found")?;
 
-                    central.stop_scan().unwrap();
+        let _ = central.stop_scan().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
-                    characteristics = peripheral.discover_characteristics().unwrap();
+        println!("Starting scan...");
+        central.start_scan(ScanFilter::default()).await
+            .map_err(|e| format!("Failed to start scan: {}", e))?;
 
-                    let mut i = 0;
-                    for _ in 0..characteristics.len() {
-                        if characteristics.get(i).unwrap().uuid
-                            != UUID::B128([
-                                0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00,
-                                0x00, 0xf3, 0xff, 0x00, 0x00,
-                            ])
-                        {
-                            characteristics.remove(i);
-                        } else {
-                            i += 1;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let peripherals = central.peripherals().await
+            .map_err(|e| format!("Failed to get peripherals: {}", e))?;
+
+        let address = btleplug::api::BDAddr::from_str_delim(addr_str)
+            .map_err(|e| format!("Invalid address format: {}", e))?;
+
+        let peripheral = peripherals.into_iter()
+            .find(|p| p.address() == address)
+            .ok_or("Device not found")?;
+
+        println!("Found device, stopping scan...");
+        let _ = central.stop_scan().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if peripheral.is_connected().await.unwrap_or(false) {
+            println!("Device was connected, disconnecting first...");
+            let _ = peripheral.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        let mut retry_count = 0;
+        let max_retries = 3;
+        let mut characteristics = Vec::new();
+
+        while retry_count < max_retries {
+            println!("Connection attempt {} of {}", retry_count + 1, max_retries);
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            match peripheral.connect().await {
+                Ok(_) => {
+                    println!("Connected, waiting before service discovery...");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    if peripheral.is_connected().await.unwrap_or(false) {
+                        match peripheral.discover_services().await {
+                            Ok(_) => {
+                                println!("Services discovered, getting characteristics...");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                                characteristics = peripheral.characteristics().into_iter().collect();
+                                println!("Found {} characteristics", characteristics.len());
+
+                                for c in &characteristics {
+                                    println!("Characteristic UUID: {:?}", c.uuid);
+                                    println!("Properties: {:?}", c.properties);
+                                }
+
+                                if !characteristics.is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(e) => println!("Service discovery error: {}", e),
                         }
+                    } else {
+                        println!("Lost connection before service discovery");
                     }
-                    //////////////////////////////////////////////////////
-
-                    break;
                 }
-                None => {}
+                Err(e) => {
+                    println!("Connection error: {}", e);
+                    if e.to_string().contains("already in progress") {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+
+            let _ = peripheral.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            retry_count += 1;
+            if retry_count < max_retries {
+                println!("Waiting before next attempt...");
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
-        let device = BleLedDevice {
+
+        if characteristics.is_empty() {
+            return Err("Failed to discover any characteristics".to_string());
+        }
+
+        // Trouver la caractéristique d'écriture une seule fois
+        let write_characteristic = characteristics.into_iter()
+            .find(|c| c.uuid.to_string().to_uppercase().contains("FFF3") &&
+                 (c.properties.contains(CharPropFlags::WRITE) || 
+                  c.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)))
+            .ok_or("No suitable write characteristic found")?;
+
+        println!("Using characteristic: {:?}", write_characteristic.uuid);
+
+        Ok(BleLedDevice {
             peripheral,
-            characteristics,
-        };
-        device.sync_time();
-        device.power_on();
-        device
+            write_characteristic,
+        })
     }
 
-    fn get_characteristic(&self) -> &btleplug::api::Characteristic {
-        self.characteristics.get(0).unwrap()
-    }
-
-    fn sync_time(&self) {
-        let system_time = chrono::offset::Local::now();
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x83,
-                    chrono::Timelike::hour(&system_time) as u8,
-                    chrono::Timelike::minute(&system_time) as u8,
-                    chrono::Timelike::second(&system_time) as u8,
-                    chrono::Datelike::weekday(&system_time).number_from_monday() as u8,
-                    0x00,
-                    0xef,
-                ],
-            )
-            .unwrap();
-    }
-
-    pub fn set_custom_time(&self, hour: u8, minute: u8, second: u8, day_of_week: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x83,
-                    hour.min(23),
-                    minute.min(59),
-                    second.min(59),
-                    day_of_week.min(7).max(1),
-                    0x00,
-                    0xef,
-                ],
-            )
-            .unwrap();
-    }
-
-    pub fn power_on(&self) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[0x7e, 0x00, 0x04, 0xf0, 0x00, 0x01, 0xff, 0x00, 0xef],
-            )
-            .unwrap();
-    }
-
-    pub fn power_off(&self) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[0x7e, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0x00, 0xef],
-            )
-            .unwrap();
-    }
-
-    pub fn set_color(&self, red_value: u8, green_value: u8, blue_value: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x05,
-                    0x03,
-                    red_value,
-                    green_value,
-                    blue_value,
-                    0x00,
-                    0xef,
-                ],
-            )
-            .unwrap();
-    }
-
-    pub fn set_brightness(&self, value: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x01,
-                    value.min(0x64),
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0xef,
-                ],
-            )
-            .unwrap();
-    }
-
-    pub fn set_effect(&self, value: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[0x7e, 0x00, 0x03, value, 0x03, 0x00, 0x00, 0x00, 0xef],
-            )
-            .unwrap();
-    }
-
-    pub fn set_effect_speed(&self, value: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x02,
-                    value.min(0x64),
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0xef,
-                ],
-            )
-            .unwrap();
-    }
-
-    pub fn set_schedule_on(&self, days: u8, hours: u8, minutes: u8, enabled: bool) {
-        let value;
-        if enabled {
-            value = days + 0x80;
-        } else {
-            value = days;
+    pub async fn write_command(&self, command: &[u8]) -> Result<(), String> {
+        // Reconnecter si nécessaire
+        if !self.peripheral.is_connected().await.unwrap_or(false) {
+            println!("Reconnecting...");
+            self.peripheral.connect().await
+                .map_err(|e| format!("Failed to connect: {}", e))?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x82,
-                    hours.min(23),
-                    minutes.min(59),
-                    0x00,
-                    0x00,
-                    value,
-                    0xef,
-                ],
-            )
-            .unwrap();
+
+        // Écrire la commande
+        self.peripheral.write(
+            &self.write_characteristic,
+            command,
+            WriteType::WithoutResponse,
+        ).await.map_err(|e| format!("Write failed: {}", e))?;
+
+        Ok(())
     }
 
-    pub fn set_schedule_off(&self, days: u8, hours: u8, minutes: u8, enabled: bool) {
-        let value;
-        if enabled {
-            value = days + 0x80;
-        } else {
-            value = days;
-        }
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[
-                    0x7e,
-                    0x00,
-                    0x82,
-                    hours.min(23),
-                    minutes.min(59),
-                    0x00,
-                    0x01,
-                    value,
-                    0xef,
-                ],
-            )
-            .unwrap();
+    pub async fn set_color(&self, r: u8, g: u8, b: u8) -> Result<(), String> {
+        println!("Setting color to RGB({}, {}, {})", r, g, b);
+        let command = [0x56, r, g, b, 0x00, 0xF0, 0xAA];
+        self.write_command(&command).await
     }
 
-    pub fn generic_command(&self, id: u8, sub_id: u8, arg1: u8, arg2: u8, arg3: u8) {
-        self.peripheral
-            .command(
-                self.get_characteristic(),
-                &[0x7e, 0x00, id, sub_id, arg1, arg2, arg3, 0x00, 0xef],
-            )
-            .unwrap();
+    pub async fn set_power(&self, on: bool) -> Result<(), String> {
+        println!("Setting power: {}", if on { "ON" } else { "OFF" });
+        let command = if on { [0xCC, 0x23, 0x33] } else { [0xCC, 0x24, 0x33] };
+        self.write_command(&command).await
+    }
+
+    pub async fn set_brightness(&self, brightness: u8) -> Result<(), String> {
+        println!("Setting brightness to {}", brightness);
+        let command = [0x56, brightness, brightness, brightness, 0x00, 0xF0, 0xAA];
+        self.write_command(&command).await
+    }
+
+    pub async fn set_warm_white(&self, brightness: u8) -> Result<(), String> {
+        println!("Setting warm white to {}", brightness);
+        let command = [0x56, brightness, brightness, 0x00, 0x0F, 0xAA];
+        self.write_command(&command).await
+    }
+
+    pub async fn set_mode(&self, mode: u8) -> Result<(), String> {
+        println!("Setting mode to: {:#04x}", mode);
+        let command = [0xBB, mode, 0x44];
+        self.write_command(&command).await
     }
 }
