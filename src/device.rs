@@ -1,13 +1,16 @@
-use btleplug::api::{Central, Manager, Peripheral, WriteType, ScanFilter, CharPropFlags, Characteristic};
+// Import required dependencies from btleplug for Bluetooth LE functionality
+use btleplug::api::{Central, Manager, Peripheral, WriteType, ScanFilter, Characteristic};
 use btleplug::platform::{Manager as PlatformManager, Peripheral as PlatformPeripheral};
 use std::time::Duration;
 
+// Main struct representing a Bluetooth LED device
 pub struct BleLedDevice {
     peripheral: PlatformPeripheral,
     write_characteristic: Characteristic,
 }
 
 impl BleLedDevice {
+    // Creates a new BleLedDevice instance by connecting to a device with the given address
     pub async fn new_with_address(addr_str: &str) -> Result<Self, String> {
         let manager = PlatformManager::new().await
             .map_err(|e| format!("Failed to create manager: {}", e))?;
@@ -18,156 +21,168 @@ impl BleLedDevice {
         let central = adapters.into_iter().next()
             .ok_or("No Bluetooth adapters found")?;
 
-        let _ = central.stop_scan().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        println!("Starting scan...");
-        central.start_scan(ScanFilter::default()).await
-            .map_err(|e| format!("Failed to start scan: {}", e))?;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
+        // First try to find already paired device
         let peripherals = central.peripherals().await
             .map_err(|e| format!("Failed to get peripherals: {}", e))?;
 
-        let address = btleplug::api::BDAddr::from_str_delim(addr_str)
-            .map_err(|e| format!("Invalid address format: {}", e))?;
-
-        let peripheral = peripherals.into_iter()
-            .find(|p| p.address() == address)
-            .ok_or("Device not found")?;
-
-        println!("Found device, stopping scan...");
-        let _ = central.stop_scan().await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        if peripheral.is_connected().await.unwrap_or(false) {
-            println!("Device was connected, disconnecting first...");
-            let _ = peripheral.disconnect().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("Found {} peripherals before scan", peripherals.len());
+        for p in &peripherals {
+            println!("Device: {:?}", p.address());
         }
 
-        let mut retry_count = 0;
-        let max_retries = 3;
-        let mut characteristics = Vec::new();
+        let peripheral = match peripherals.into_iter().find(|p| p.address().to_string() == addr_str) {
+            Some(p) => {
+                println!("Found paired device: {:?}", p.address());
+                p
+            },
+            None => {
+                // If not found, start scanning
+                println!("Device not paired, starting scan...");
+                central.start_scan(ScanFilter::default()).await
+                    .map_err(|e| format!("Failed to start scan: {}", e))?;
 
-        while retry_count < max_retries {
-            println!("Connection attempt {} of {}", retry_count + 1, max_retries);
+                println!("Scanning for 5 seconds...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+                let peripherals = central.peripherals().await
+                    .map_err(|e| format!("Failed to get peripherals: {}", e))?;
 
+                println!("Found {} peripherals after scan", peripherals.len());
+                for p in &peripherals {
+                    // Check if device is in pairing mode
+                    if let Ok(Some(props)) = p.properties().await {
+                        println!("Device: {:?} - Name: {} - RSSI: {:?}", 
+                            p.address(), 
+                            props.local_name.unwrap_or_default(),
+                            props.rssi
+                        );
+                    }
+                }
+
+                let p = peripherals.into_iter()
+                    .find(|p| p.address().to_string() == addr_str)
+                    .ok_or("Device not found")?;
+
+                // Verify if device is in pairing mode
+                if let Ok(Some(props)) = p.properties().await {
+                    if props.rssi.unwrap_or(-100) < -90 {
+                        return Err("Device signal too weak or not in pairing mode. Please reset the device and try again.".to_string());
+                    }
+                    println!("Device found with good signal strength!");
+                }
+
+                println!("Found device in scan: {:?}", p.address());
+                let _ = central.stop_scan().await;
+                p
+            }
+        };
+
+        // Connection needed
+        println!("Connecting to device...");
+        for attempt in 1..=3 {
+            println!("Connection attempt {} of 3...", attempt);
+            
+            // Essayons de se déconnecter d'abord au cas où
+            let _ = peripheral.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            
             match peripheral.connect().await {
                 Ok(_) => {
-                    println!("Connected, waiting before service discovery...");
+                    println!("Connected!");
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
-                    if peripheral.is_connected().await.unwrap_or(false) {
-                        match peripheral.discover_services().await {
-                            Ok(_) => {
-                                println!("Services discovered, getting characteristics...");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                    // Essayons de découvrir les services immédiatement après la connexion
+                    println!("Discovering services...");
+                    match peripheral.discover_services().await {
+                        Ok(_) => {
+                            println!("Services discovered!");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
 
-                                characteristics = peripheral.characteristics().into_iter().collect();
-                                println!("Found {} characteristics", characteristics.len());
+                            let chars = peripheral.characteristics();
+                            println!("Found {} characteristics", chars.len());
 
-                                for c in &characteristics {
-                                    println!("Characteristic UUID: {:?}", c.uuid);
-                                    println!("Properties: {:?}", c.properties);
-                                }
-
-                                if !characteristics.is_empty() {
-                                    break;
-                                }
+                            if let Some(write_char) = chars.into_iter().find(|c| {
+                                let uuid = c.uuid.to_string().to_uppercase();
+                                uuid.contains("FFE9") || uuid.contains("FFF3")
+                            }) {
+                                println!("Found characteristic: {}", write_char.uuid);
+                                println!("Ready to send commands");
+                                return Ok(BleLedDevice {
+                                    peripheral,
+                                    write_characteristic: write_char,
+                                });
                             }
-                            Err(e) => println!("Service discovery error: {}", e),
-                        }
-                    } else {
-                        println!("Lost connection before service discovery");
+                        },
+                        Err(e) => println!("Service discovery failed: {}", e),
                     }
-                }
+                },
                 Err(e) => {
-                    println!("Connection error: {}", e);
-                    if e.to_string().contains("already in progress") {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    println!("Connection attempt failed: {}", e);
+                    if attempt < 3 {
+                        println!("Waiting before next attempt...");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        return Err("Failed to connect after 3 attempts".to_string());
                     }
                 }
             }
-
-            let _ = peripheral.disconnect().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-
-            retry_count += 1;
-            if retry_count < max_retries {
-                println!("Waiting before next attempt...");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
         }
 
-        if characteristics.is_empty() {
-            return Err("Failed to discover any characteristics".to_string());
-        }
-
-        // Trouver la caractéristique d'écriture une seule fois
-        let write_characteristic = characteristics.into_iter()
-            .find(|c| c.uuid.to_string().to_uppercase().contains("FFF3") &&
-                 (c.properties.contains(CharPropFlags::WRITE) || 
-                  c.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)))
-            .ok_or("No suitable write characteristic found")?;
-
-        println!("Using characteristic: {:?}", write_characteristic.uuid);
-
-        Ok(BleLedDevice {
-            peripheral,
-            write_characteristic,
-        })
+        Err("Failed to establish connection and discover services".to_string())
     }
 
+    // Helper function to write commands to the device
     pub async fn write_command(&self, command: &[u8]) -> Result<(), String> {
-        // Reconnecter si nécessaire
-        if !self.peripheral.is_connected().await.unwrap_or(false) {
-            println!("Reconnecting...");
-            self.peripheral.connect().await
-                .map_err(|e| format!("Failed to connect: {}", e))?;
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
-        // Écrire la commande
         self.peripheral.write(
             &self.write_characteristic,
             command,
             WriteType::WithoutResponse,
-        ).await.map_err(|e| format!("Write failed: {}", e))?;
-
-        Ok(())
+        ).await.map_err(|e| format!("Write failed: {}", e))
     }
 
-    pub async fn set_color(&self, r: u8, g: u8, b: u8) -> Result<(), String> {
-        println!("Setting color to RGB({}, {}, {})", r, g, b);
-        let command = [0x56, r, g, b, 0x00, 0xF0, 0xAA];
-        self.write_command(&command).await
-    }
-
+    // Turn the device on or off
     pub async fn set_power(&self, on: bool) -> Result<(), String> {
         println!("Setting power: {}", if on { "ON" } else { "OFF" });
-        let command = if on { [0xCC, 0x23, 0x33] } else { [0xCC, 0x24, 0x33] };
+        let command = if on {
+            [0x7e, 0x00, 0x04, 0xf0, 0x00, 0x01, 0xff, 0x00, 0xef]
+        } else {
+            [0x7e, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0x00, 0xef]
+        };
         self.write_command(&command).await
     }
 
+    // Set RGB color values
+    pub async fn set_color(&self, r: u8, g: u8, b: u8) -> Result<(), String> {
+        println!("Setting color to RGB({}, {}, {})", r, g, b);
+        let command = [0x7e, 0x00, 0x05, 0x03, r, g, b, 0x00, 0xef];
+        self.write_command(&command).await
+    }
+
+    // Set brightness level (0-100%)
     pub async fn set_brightness(&self, brightness: u8) -> Result<(), String> {
-        println!("Setting brightness to {}", brightness);
-        let command = [0x56, brightness, brightness, brightness, 0x00, 0xF0, 0xAA];
+        let value = brightness.min(0x64); // Max 100%
+        println!("Setting brightness to {}", value);
+        let command = [0x7e, 0x00, 0x01, value, 0x00, 0x00, 0x00, 0x00, 0xef];
         self.write_command(&command).await
     }
 
+    // Set warm white mode with brightness
     pub async fn set_warm_white(&self, brightness: u8) -> Result<(), String> {
         println!("Setting warm white to {}", brightness);
-        let command = [0x56, brightness, brightness, 0x00, 0x0F, 0xAA];
+        let command = [0x7e, 0x00, 0x05, 0x02, brightness, brightness, brightness, 0x00, 0xef];
         self.write_command(&command).await
     }
 
-    pub async fn set_mode(&self, mode: u8) -> Result<(), String> {
-        println!("Setting mode to: {:#04x}", mode);
-        let command = [0xBB, mode, 0x44];
-        self.write_command(&command).await
+    // Set custom animation effect with speed
+    pub async fn set_custom_effect(&self, effect_code: u8, speed: u8) -> Result<(), String> {
+        println!("Setting custom effect: {:#04x} with speed: {}", effect_code, speed);
+        // First set the effect type
+        let command1 = [0x7e, 0x00, 0x03, effect_code, 0x03, 0x00, 0x00, 0x00, 0xef];
+        self.write_command(&command1).await?;
+        
+        // Then set the animation speed
+        let speed_value = speed.min(0x64); // Max 100%
+        let command2 = [0x7e, 0x00, 0x02, speed_value, 0x00, 0x00, 0x00, 0x00, 0xef];
+        self.write_command(&command2).await
     }
 }
